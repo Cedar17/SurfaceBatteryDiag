@@ -140,6 +140,57 @@ static std::string power_state(ULONG ps){
     return s.empty() ? "0" : s;
 }
 
+static std::wstring setupdi_property_string(HDEVINFO hdev, SP_DEVINFO_DATA& dev, DWORD prop) {
+    DWORD type = 0, needed = 0;
+    SetupDiGetDeviceRegistryPropertyW(hdev, &dev, prop, &type, nullptr, 0, &needed);
+    if (!needed) return L"";
+    std::vector<BYTE> buf(needed + sizeof(wchar_t) * 2, 0);
+    if (!SetupDiGetDeviceRegistryPropertyW(hdev, &dev, prop, &type,
+                                            buf.data(), static_cast<DWORD>(buf.size()),
+                                            &needed)) return L"";
+    return reinterpret_cast<const wchar_t*>(buf.data());
+}
+static std::wstring setupdi_instance_id(HDEVINFO hdev, SP_DEVINFO_DATA& dev) {
+    DWORD needed = 0;
+    SetupDiGetDeviceInstanceIdW(hdev, &dev, nullptr, 0, &needed);
+    if (!needed) return L"";
+    std::vector<wchar_t> buf(needed + 1, 0);
+    if (!SetupDiGetDeviceInstanceIdW(hdev, &dev, buf.data(),
+                                     static_cast<DWORD>(buf.size()), nullptr)) return L"";
+    return buf.data();
+}
+static std::wstring reg_string(HKEY root, const std::wstring& subkey, const wchar_t* value) {
+    HKEY h = nullptr;
+    if (RegOpenKeyExW(root, subkey.c_str(), 0, KEY_READ, &h) != ERROR_SUCCESS) return L"";
+    DWORD type = 0, bytes = 0;
+    LONG rc = RegQueryValueExW(h, value, nullptr, &type, nullptr, &bytes);
+    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) { RegCloseKey(h); return L""; }
+    std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 2, 0);
+    rc = RegQueryValueExW(h, value, nullptr, &type, reinterpret_cast<BYTE*>(buf.data()), &bytes);
+    RegCloseKey(h);
+    return rc == ERROR_SUCCESS ? std::wstring(buf.data()) : L"";
+}
+static void dump_pnp_device(std::ostream& out, HDEVINFO hdev, SP_DEVINFO_DATA& dev) {
+    const std::wstring instance = setupdi_instance_id(hdev, dev);
+    const std::wstring desc = setupdi_property_string(hdev, dev, SPDRP_DEVICEDESC);
+    const std::wstring mfg = setupdi_property_string(hdev, dev, SPDRP_MFG);
+    const std::wstring service = setupdi_property_string(hdev, dev, SPDRP_SERVICE);
+    const std::wstring hwid = setupdi_property_string(hdev, dev, SPDRP_HARDWAREID);
+    const std::wstring driverKey = setupdi_property_string(hdev, dev, SPDRP_DRIVER);
+    out << "Device instance ID: " << utf8(instance) << "\n";
+    out << "Device description: " << utf8(desc) << "\n";
+    out << "Manufacturer: " << utf8(mfg) << "\n";
+    out << "Service: " << utf8(service) << "\n";
+    out << "Hardware ID: " << utf8(hwid) << "\n";
+    out << "Driver key: " << utf8(driverKey) << "\n";
+    if (!driverKey.empty()) {
+        const std::wstring base = L"SYSTEM\\CurrentControlSet\\Control\\Class\\" + driverKey;
+        out << "Driver INF: " << utf8(reg_string(HKEY_LOCAL_MACHINE, base, L"InfPath")) << "\n";
+        out << "Driver version: " << utf8(reg_string(HKEY_LOCAL_MACHINE, base, L"DriverVersion")) << "\n";
+        out << "Driver provider: " << utf8(reg_string(HKEY_LOCAL_MACHINE, base, L"ProviderName")) << "\n";
+    }
+}
+
 
 static size_t acpi_arg_span_v1(const AcpiMethodArgumentV1Local* a) {
     const size_t data = std::max<size_t>(sizeof(ULONG), a->DataLength);
@@ -224,19 +275,23 @@ static void interpret_bst_flat(std::ostream& out, const std::vector<ULONG>& v) {
     }
 }
 
-static std::string error_text(DWORD e) {
-    LPWSTR msg = nullptr;
-    DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-                             FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, e, 0,
-                             reinterpret_cast<LPWSTR>(&msg), 0, nullptr);
-    std::string s;
-    if (n && msg) {
-        s = utf8(std::wstring(msg, n));
-        LocalFree(msg);
-        while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+static const char* win32_error_name(DWORD e) {
+    switch (e) {
+        case ERROR_SUCCESS: return "ERROR_SUCCESS";
+        case ERROR_INVALID_FUNCTION: return "ERROR_INVALID_FUNCTION";
+        case ERROR_FILE_NOT_FOUND: return "ERROR_FILE_NOT_FOUND";
+        case ERROR_PATH_NOT_FOUND: return "ERROR_PATH_NOT_FOUND";
+        case ERROR_ACCESS_DENIED: return "ERROR_ACCESS_DENIED";
+        case ERROR_INVALID_HANDLE: return "ERROR_INVALID_HANDLE";
+        case ERROR_NOT_ENOUGH_MEMORY: return "ERROR_NOT_ENOUGH_MEMORY";
+        case ERROR_INVALID_DATA: return "ERROR_INVALID_DATA";
+        case ERROR_NOT_SUPPORTED: return "ERROR_NOT_SUPPORTED";
+        case ERROR_INVALID_PARAMETER: return "ERROR_INVALID_PARAMETER";
+        case ERROR_INSUFFICIENT_BUFFER: return "ERROR_INSUFFICIENT_BUFFER";
+        case ERROR_NO_MORE_ITEMS: return "ERROR_NO_MORE_ITEMS";
+        case ERROR_GEN_FAILURE: return "ERROR_GEN_FAILURE";
+        default: return "UNMAPPED_WIN32_ERROR";
     }
-    if (s.empty()) s = "unknown";
-    return s;
 }
 
 static std::vector<std::wstring> enumerate_interface_paths(const GUID& guid) {
@@ -294,7 +349,7 @@ static bool try_acpi_eval_v1(HANDLE h, const char method[5],
     if (!ok) {
         lastError = GetLastError();
         out << "  legacy " << method << ": FAILED Win32=" << lastError
-            << " (" << error_text(lastError) << ")\n";
+            << " (" << win32_error_name(lastError) << ")\n";
         return false;
     }
 
@@ -346,7 +401,7 @@ static void try_acpi_eval_v2_status(HANDLE h, const char method[5],
     if (!ok) {
         DWORD e = GetLastError();
         out << "  v2     " << method << ": FAILED Win32=" << e
-            << " (" << error_text(e) << ")\n";
+            << " (" << win32_error_name(e) << ")\n";
         return;
     }
 
@@ -369,7 +424,7 @@ static void probe_acpi_on_path(std::ostream& out,
     HANDLE h = open_probe_handle(path, openError);
     if (h == INVALID_HANDLE_VALUE) {
         out << "CreateFile: FAILED Win32=" << openError
-            << " (" << error_text(openError) << ")\n";
+            << " (" << win32_error_name(openError) << ")\n";
         return;
     }
     out << "CreateFile: SUCCESS\n";
@@ -417,26 +472,41 @@ int wmain(int argc, wchar_t** argv) {
     for(int i=1;i<argc;i++) if(std::wstring(argv[i])==L"--no-pause") nopause=true;
 
     std::ostringstream out;
-    out<<"SurfaceBatteryDiag v0.2.0\n";
+    out<<"SurfaceBatteryDiag v1.0.0\n";
     out<<"Purpose: inspect raw Windows battery-class telemetry and compare documented mW interpretation\n";
     out<<"with the diagnostic counterfactual that the same numeric rate might actually represent mA.\n\n";
 
     out<<"=== SYSTEM ===\n";
     out<<run_capture(
         L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-        L"\"$ErrorActionPreference='SilentlyContinue'; "
-        L"Get-CimInstance Win32_ComputerSystemProduct | Select Vendor,Name,Version,IdentifyingNumber | Format-List; "
-        L"Get-CimInstance Win32_OperatingSystem | Select Caption,Version,BuildNumber,OSArchitecture | Format-List\"");
+        L"\"[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+        L"$ErrorActionPreference='SilentlyContinue'; "
+        L"$p=Get-CimInstance Win32_ComputerSystemProduct; "
+        L"Write-Output ('Vendor=' + $p.Vendor); "
+        L"Write-Output ('Model=' + $p.Name); "
+        L"Write-Output ('ProductVersion=' + $p.Version); "
+        L"Write-Output ('ProductID=' + $p.IdentifyingNumber); "
+        L"Write-Output ('OSVersion=' + [Environment]::OSVersion.Version.ToString()); "
+        L"Write-Output ('Architecture=' + $env:PROCESSOR_ARCHITECTURE)\"");
 
     out<<"\n=== WMI root\\wmi BatteryStatus ===\n";
     out<<run_capture(
         L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
-        L"\"Get-CimInstance -Namespace root\\wmi -ClassName BatteryStatus | "
-        L"Select InstanceName,PowerOnline,Charging,Discharging,Voltage,RemainingCapacity,ChargeRate,DischargeRate,Critical | Format-List\"");
+        L"\"[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); "
+        L"$ErrorActionPreference='SilentlyContinue'; "
+        L"$items=@(Get-CimInstance -Namespace root\\wmi -ClassName BatteryStatus); "
+        L"foreach($b in $items){ "
+        L"Write-Output ('InstanceName=' + $b.InstanceName); "
+        L"Write-Output ('PowerOnline=' + $b.PowerOnline); "
+        L"Write-Output ('Charging=' + $b.Charging); "
+        L"Write-Output ('Discharging=' + $b.Discharging); "
+        L"Write-Output ('Voltage_mV=' + $b.Voltage); "
+        L"Write-Output ('RemainingCapacity=' + $b.RemainingCapacity); "
+        L"Write-Output ('ChargeRate=' + $b.ChargeRate); "
+        L"Write-Output ('DischargeRate=' + $b.DischargeRate); "
+        L"Write-Output ('Critical=' + $b.Critical) }\"");
 
-    out<<"\n=== PNP BATTERY STACK ===\n";
-    out<<run_capture(L"cmd.exe /d /c pnputil /enum-devices /class Battery /deviceids /stack /drivers /services /interfaces");
-
+    out<<"\n=== BATTERY PNP / DRIVER INFORMATION ===\n";
     HDEVINFO hdev=SetupDiGetClassDevsW(&GUID_DEVCLASS_BATTERY,nullptr,nullptr,DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
     if(hdev==INVALID_HANDLE_VALUE){
         out<<"\nSetupDiGetClassDevs failed.\n";
@@ -454,10 +524,13 @@ int wmain(int argc, wchar_t** argv) {
             std::vector<BYTE> mem(need);
             auto detail=reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(mem.data());
             detail->cbSize=sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-            if(!SetupDiGetDeviceInterfaceDetailW(hdev,&ifd,detail,need,nullptr,nullptr)) continue;
+            SP_DEVINFO_DATA dev{};
+            dev.cbSize = sizeof(dev);
+            if(!SetupDiGetDeviceInterfaceDetailW(hdev,&ifd,detail,need,nullptr,&dev)) continue;
 
             out<<"\n=== BATTERY "<<idx<<" ===\n";
-            out<<"DevicePath: "<<utf8(detail->DevicePath)<<"\n";
+            dump_pnp_device(out, hdev, dev);
+            out<<"Device interface path: "<<utf8(detail->DevicePath)<<"\n";
 
             HANDLE h=CreateFileW(detail->DevicePath,GENERIC_READ|GENERIC_WRITE,
                 FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
@@ -548,7 +621,9 @@ int wmain(int argc, wchar_t** argv) {
     out<<"If Capacity relative is NO, Windows documents Rate as mW and Capacity as mWh.\n";
     out<<"If direct IOCTL and WMI both report roughly the same implausibly small rate, HWiNFO/TrafficMonitor are probably not the source of the error.\n";
     out<<"If treating the exact raw rate number as mA and multiplying by battery voltage yields a realistic several-watt drain, that is evidence consistent with an mA-vs-mW unit-path bug, but not proof.\n";
-    out<<"Direct ACPI _BST/_BIX evaluation is not attempted by this user-mode tool.\n";
+    out<<"Direct user-mode ACPI _BST/_BIX/_BIF evaluation was attempted on the battery and Surface interfaces.\n";
+    out<<"ERROR_NOT_SUPPORTED (Win32 50) means these device stacks do not expose ACPI evaluation to this user-mode caller.\n";
+    out<<"Therefore this tool cannot distinguish a firmware/ACPI source-value error from a SurfaceBattery driver conversion error.\n";
 
     std::string ts=timestamp(); std::wstring wts(ts.begin(),ts.end());
     std::wstring reportPath=exe_dir()+L"\\SurfaceBatteryDiag-"+wts+L".txt";
