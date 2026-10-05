@@ -1,9 +1,8 @@
-name: Build Windows EXE
+name: Build and Release
 
 on:
   push:
     branches: ["master", "main"]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -13,8 +12,10 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure x64
         run: cmake -S . -B build -A x64
@@ -37,13 +38,34 @@ jobs:
           path: build/Release/SurfaceBatteryDiag.exe
           if-no-files-found: error
 
-      - name: Create GitHub Release for tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish v1.0.0
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $version = "v1.0.0"
+          $repo = "${{ github.repository }}"
+          if (gh release view $version --repo $repo *> $null) {
+            Write-Host "$version already exists; leaving the published release unchanged."
+            exit 0
+          }
+
           $exe = "build/Release/SurfaceBatteryDiag.exe"
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          "Windows x64 standalone build.`n`nSHA256: $hash" | Set-Content release-notes.txt
-          gh release create "${{ github.ref_name }}" $exe --title "${{ github.ref_name }}" --notes-file release-notes.txt
+
+          @"
+          First stable release of SurfaceBatteryDiag.
+
+          Focus:
+          - direct Windows battery-class telemetry
+          - WMI BatteryStatus cross-check
+          - Surface battery PnP/driver identity
+          - 10-second raw discharge-rate trace
+          - experimental user-mode ACPI _BST/_BIX/_BIF probe
+          - English, search-friendly diagnostic output
+
+          SHA256: $hash
+          "@ | Set-Content release-notes.md -Encoding utf8
+
+          gh release create $version $exe --repo $repo --target "${{ github.sha }}" --title "SurfaceBatteryDiag v1.0.0" --notes-file release-notes.md
