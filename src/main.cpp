@@ -2,10 +2,13 @@
 #define NOMINMAX
 #include <windows.h>
 #include <winioctl.h>
-#include <ntddbat.h>
 #include <setupapi.h>
 #include <devguid.h>
 #include <batclass.h>
+
+#ifndef FILE_DEVICE_BATTERY
+#define FILE_DEVICE_BATTERY 0x00000029
+#endif
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
