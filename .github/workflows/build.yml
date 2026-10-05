@@ -1,0 +1,49 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: ["master", "main"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure x64
+        run: cmake -S . -B build -A x64
+
+      - name: Build Release
+        run: cmake --build build --config Release --parallel
+
+      - name: Verify EXE and SHA256
+        shell: pwsh
+        run: |
+          $exe = "build/Release/SurfaceBatteryDiag.exe"
+          if (-not (Test-Path $exe)) { throw "EXE not produced" }
+          Get-Item $exe | Format-List Name,Length,FullName
+          Get-FileHash $exe -Algorithm SHA256
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SurfaceBatteryDiag-windows-x64
+          path: build/Release/SurfaceBatteryDiag.exe
+          if-no-files-found: error
+
+      - name: Create GitHub Release for tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $exe = "build/Release/SurfaceBatteryDiag.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "Windows x64 standalone build.`n`nSHA256: $hash" | Set-Content release-notes.txt
+          gh release create "${{ github.ref_name }}" $exe --title "${{ github.ref_name }}" --notes-file release-notes.txt
