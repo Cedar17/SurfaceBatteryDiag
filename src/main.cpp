@@ -1,6 +1,8 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winioctl.h>
+#include <ntddbat.h>
 #include <setupapi.h>
 #include <devguid.h>
 #include <batclass.h>
